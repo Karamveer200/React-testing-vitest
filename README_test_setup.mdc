@@ -1,0 +1,351 @@
+## Testing rules and setup helper (for Cursor)
+
+This file is a **generic guide** and **set of rules** to help Cursor (and humans) set up and maintain a good React testing environment in this project or any similar React app.
+
+### 1. Core goals
+
+- **Write integration‑style tests first**: prefer tests that render real components, talk to real providers, and interact with the DOM the way a user would.
+- **Mock the network, not the component**: use an HTTP mocking layer instead of stubbing out your own components’ logic.
+- **Keep setup centralized**: shared configuration (mocks, polyfills, providers) should live in a small number of files so new tests stay simple.
+
+### 2. Required testing dependencies
+
+When adding or fixing tests, ensure these dependencies exist (usually as `devDependencies`):
+
+- **Test runner / environment**
+  - `vitest`
+  - `jsdom`
+  - `@vitest/ui` (optional UI test runner)
+- **DOM testing**
+  - `@testing-library/react`
+  - `@testing-library/jest-dom`
+  - `@testing-library/user-event`
+- **Network mocking**
+  - `msw`
+  - `@mswjs/data`
+  - `@faker-js/faker`
+- **DOM polyfills**
+  - `resize-observer-polyfill`
+
+To install everything from scratch (no versions):
+
+```bash
+npm install --save-dev \
+  @faker-js/faker \
+  @mswjs/data \
+  @testing-library/jest-dom \
+  @testing-library/react \
+  @testing-library/user-event \
+  @vitest/ui \
+  jsdom \
+  msw \
+  resize-observer-polyfill \
+  vitest
+```
+
+If you use `pnpm` or `yarn`, replace `npm install --save-dev` with the equivalent command.
+
+**Rule for Cursor:** if tests fail because these packages are missing or mis‑configured, prefer installing/configuring them rather than writing ad‑hoc mocks in each test file.
+
+### 3. Vitest config rules
+
+When editing or creating `vitest.config.*`:
+
+- Always set:
+  - `test.environment = 'jsdom'`
+  - `test.globals = true`
+  - `test.setupFiles` to a single setup file (for example `tests/setup.ts`).
+- Never duplicate global setup (MSW, jest‑dom, DOM polyfills) inside individual test files.
+
+Typical config:
+
+```ts
+import { defineConfig } from 'vitest/config';
+
+export default defineConfig({
+  test: {
+    environment: 'jsdom',
+    globals: true,
+    setupFiles: 'tests/setup.ts',
+  },
+});
+```
+
+If you are using **TypeScript**, also ensure your `tsconfig.json` includes Vitest globals types under `compilerOptions`:
+
+```json
+"compilerOptions": {
+  // ...other options...
+  "types": ["vitest/globals"]
+}
+```
+
+**Rule for Cursor:** move any repeated global hooks (`beforeAll`, `afterEach`, `afterAll`) or library initialization into the shared setup file referenced by `vitest.config.*`.
+
+### 4. Global setup rules (`tests/setup.ts`)
+
+The global setup file should:
+
+- Enable jest‑dom matchers by importing `@testing-library/jest-dom/vitest` once.
+- Start and stop the MSW server with `beforeAll`, `afterEach`, and `afterAll` so tests stay isolated.
+- Define or mock external SDKs (auth, analytics, feature flags) with `vi.mock(...)` so tests don’t call real services.
+- Add DOM polyfills/mocks (`ResizeObserver`, `scrollIntoView`, `matchMedia`, etc.) needed by components.
+
+Example structure:
+
+```ts
+import '@testing-library/jest-dom/vitest';
+import { server } from './mocks/server';
+import ResizeObserver from 'resize-observer-polyfill';
+import { PropsWithChildren, ReactNode } from 'react';
+
+beforeAll(() => server.listen());
+afterEach(() => server.resetHandlers());
+afterAll(() => server.close());
+
+vi.mock('@auth0/auth0-react', () => ({
+  useAuth0: vi.fn().mockReturnValue({
+    isAuthenticated: false,
+    isLoading: false,
+    user: undefined,
+  }),
+  Auth0Provider: ({ children }: PropsWithChildren) => children,
+  withAuthenticationRequired: (component: ReactNode) => component,
+}));
+
+global.ResizeObserver = ResizeObserver as unknown as typeof ResizeObserver;
+
+window.HTMLElement.prototype.scrollIntoView = vi.fn();
+window.HTMLElement.prototype.hasPointerCapture = vi.fn();
+window.HTMLElement.prototype.releasePointerCapture = vi.fn();
+
+Object.defineProperty(window, 'matchMedia', {
+  writable: true,
+  value: vi.fn().mockImplementation((query) => ({
+    matches: false,
+    media: query,
+    onchange: null,
+    addListener: vi.fn(),
+    removeListener: vi.fn(),
+    addEventListener: vi.fn(),
+    removeEventListener: vi.fn(),
+    dispatchEvent: vi.fn(),
+  })),
+});
+```
+
+**Rule for Cursor:** when you see the same SDK mock or DOM polyfill in multiple test files, consolidate it into `tests/setup.ts` instead of copying it again.
+
+### 5. MSW and data modeling rules
+
+For API and data behavior:
+
+- Use **MSW** to intercept HTTP calls instead of mocking `fetch`/`axios` directly.
+- Use **`@mswjs/data` + `@faker-js/faker`** when the app needs realistic or relational data (products, users, categories, etc.).
+- Seed data in `beforeAll`/`beforeEach` and clean up in `afterAll`/`afterEach` to keep tests deterministic.
+- Override handlers per test with `server.use(...)` to simulate success, error, empty results, or slow responses.
+
+Typical MSW setup:
+
+```ts
+// tests/mocks/db.ts
+import { factory, manyOf, oneOf, primaryKey } from '@mswjs/data';
+import { faker } from '@faker-js/faker';
+
+export const db = factory({
+  category: {
+    id: primaryKey(faker.number.int),
+    name: faker.commerce.department,
+    products: manyOf('product'),
+  },
+  product: {
+    id: primaryKey(faker.number.int),
+    name: faker.commerce.productName,
+    price: () => faker.number.int({ min: 1, max: 100 }),
+    categoryId: faker.number.int,
+    category: oneOf('category'),
+  },
+});
+
+// tests/mocks/handlers.ts
+import { db } from './db';
+
+export const handlers = [
+  ...db.product.toHandlers('rest'),
+  ...db.category.toHandlers('rest'),
+];
+
+// tests/mocks/server.ts
+import { setupServer } from 'msw/node';
+import { handlers } from './handlers';
+
+export const server = setupServer(...handlers);
+```
+
+**Rule for Cursor:** never call real external APIs from tests; always add or adjust MSW handlers and/or the in‑memory data layer.
+
+### 6. React Testing Library usage rules
+
+When writing or updating tests with React Testing Library:
+
+- Prefer **user‑facing queries** (`getByRole`, `getByLabelText`, `getByText`, `findBy*`) instead of `querySelector` or test IDs, unless test IDs are truly necessary.
+- Use async queries (`findBy*`, `waitFor`, `waitForElementToBeRemoved`) whenever the UI changes after async work (data fetching, transitions, timers).
+- Use **`user-event`** (`userEvent.click`, `userEvent.type`, etc.) to simulate real user interactions rather than low‑level `fireEvent` where possible.
+
+**Rule for Cursor:** if a test is brittle or tightly coupled to DOM structure (e.g. complex CSS selectors), refactor it to use more semantic queries and user‑level interactions.
+
+### 7. Providers and wrappers
+
+App‑wide providers should be factored into a single wrapper component (for example `tests/AllProviders.tsx`) that includes things like:
+
+- Data/cache providers (React Query, Redux Provider, etc.).
+- App contexts (cart, auth, feature flags, theme).
+- UI theme providers.
+
+Example:
+
+```tsx
+import { PropsWithChildren } from 'react';
+import { QueryClient, QueryClientProvider } from 'react-query';
+import { CartProvider } from '../src/providers/CartProvider';
+import { Theme } from '@radix-ui/themes';
+
+const AllProviders = ({ children }: PropsWithChildren) => {
+  const client = new QueryClient({
+    defaultOptions: {
+      queries: {
+        retry: false,
+      },
+    },
+  });
+
+  return (
+    <QueryClientProvider client={client}>
+      <CartProvider>
+        <Theme>{children}</Theme>
+      </CartProvider>
+    </QueryClientProvider>
+  );
+};
+
+export default AllProviders;
+```
+
+Tests should render components like:
+
+```ts
+render(<MyComponent />, { wrapper: AllProviders });
+```
+
+**Rule for Cursor:** if you see many tests manually recreating the same provider tree, extract or reuse an `AllProviders`‑style wrapper so new tests stay short and consistent.
+
+### 8. Auth and routing rules
+
+- **Auth**
+  - Mock auth SDKs once globally in the setup file.
+  - Provide helpers (e.g. `mockAuthState`) that individual tests can call to switch between anonymous, authenticated, or loading states.
+- **Routing**
+  - Use a memory‑based router (`MemoryRouter`, `createMemoryRouter`) for tests.
+  - Provide simple helpers (for example `navigateTo(path)`) to set initial routes and render with the app routes.
+
+Typical helpers:
+
+```ts
+// tests/utils.tsx
+import { HttpResponse, delay, http } from 'msw';
+import { server } from './mocks/server';
+import { User, useAuth0 } from '@auth0/auth0-react';
+import { render } from '@testing-library/react';
+import { RouterProvider, createMemoryRouter } from 'react-router-dom';
+import routes from '../src/routes';
+
+export const simulateDelay = (endpoint: string) => {
+  server.use(
+    http.get(endpoint, async () => {
+      await delay();
+      return HttpResponse.json([]);
+    }),
+  );
+};
+
+export const simulateError = (endpoint: string) => {
+  server.use(http.get(endpoint, () => HttpResponse.error()));
+};
+
+type AuthState = {
+  isAuthenticated: boolean;
+  isLoading: boolean;
+  user: User | undefined;
+};
+
+export const mockAuthState = (authState: AuthState) => {
+  vi.mocked(useAuth0).mockReturnValue({
+    ...authState,
+    getAccessTokenSilently: vi.fn().mockResolvedValue('a'),
+    getAccessTokenWithPopup: vi.fn(),
+    getIdTokenClaims: vi.fn(),
+    loginWithRedirect: vi.fn(),
+    loginWithPopup: vi.fn(),
+    logout: vi.fn(),
+    handleRedirectCallback: vi.fn(),
+  });
+};
+
+export const navigateTo = (path: string) => {
+  const router = createMemoryRouter(routes, {
+    initialEntries: [path],
+  });
+
+  render(<RouterProvider router={router} />);
+};
+```
+
+**Rule for Cursor:** do not wire tests to a real browser history or full router config in each file; use memory routers and shared helpers instead.
+
+### 9. Writing new tests – checklist
+
+When Cursor (or a human) adds new tests for a React component/page, follow this checklist:
+
+1. **Render the real component** with the shared providers wrapper.
+2. **Shape the backend behavior** using MSW (and in‑memory data factories if available).
+3. **Interact via `user-event`** (click, type, etc.) rather than setting props or state directly.
+4. **Assert using jest‑dom** matchers against the visible DOM.
+5. **Avoid duplicate setup** that belongs in `vitest.config.*`, `tests/setup.ts`, or shared helpers.
+
+Example test flow:
+
+```tsx
+import { render, screen } from '@testing-library/react';
+import MyComponent from '../../src/components/MyComponent';
+import AllProviders from '../AllProviders';
+
+describe('MyComponent', () => {
+  it('shows data from the server', async () => {
+    render(<MyComponent />, { wrapper: AllProviders });
+
+    expect(await screen.findByText(/some text/i)).toBeInTheDocument();
+  });
+});
+```
+
+If any of these steps are missing, prefer fixing the **shared test setup** first; only add one‑off code in a test file when it is truly specific to that scenario.
+
+### 10. Running tests
+
+Use the npm scripts defined in `package.json` (or equivalent commands if using another package manager):
+
+```bash
+npm test         # run tests in watch mode with Vitest
+npm run test:ui  # run Vitest UI (@vitest/ui)
+npm run coverage # run tests and collect coverage
+```
+
+The corresponding `package.json` entries should look like:
+
+```json
+"scripts": {
+  "test": "vitest",
+  "test:ui": "vitest --ui",
+  "coverage": "vitest run --coverage"
+}
+```

@@ -1,5 +1,4 @@
 import { render, screen } from "@testing-library/react";
-import { it, expect, describe } from "vitest";
 import UserAccount from "../../src/components/UserAccount";
 
 describe("UserAccount", () => {
@@ -11,6 +10,8 @@ describe("UserAccount", () => {
     };
 
     render(<UserAccount user={adminUser} />);
+
+    screen.debug();
 
     const button = screen.getByRole("button");
     expect(button).toBeInTheDocument();
